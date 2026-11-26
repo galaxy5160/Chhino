@@ -1,5 +1,6 @@
 package com.chhino.action
 
+import android.content.Context
 import com.chhino.capture.CaptureEvent
 import com.chhino.capture.CaptureManager
 import com.chhino.data.database.dao.HomeLocationDao
@@ -7,6 +8,8 @@ import com.chhino.data.database.dao.RideHistoryDao
 import com.chhino.data.database.entities.RideHistoryEntity
 import com.chhino.data.preferences.SettingsDataStore
 import com.chhino.data.preferences.UserSettings
+import com.chhino.intelligence.home.DestinationGeocoder
+import com.chhino.intelligence.home.HomeDistanceCalculator
 import com.chhino.intelligence.home.HomeDistanceResult
 import com.chhino.intelligence.home.HomeZone
 import com.chhino.intelligence.profit.ExpenseProfile
@@ -16,6 +19,8 @@ import com.chhino.intelligence.scoring.RideScoringEngine
 import com.chhino.parse.ParseResult
 import com.chhino.parse.RideOffer
 import com.chhino.parse.RideParser
+import com.chhino.rules.RulesEngine
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -36,6 +41,7 @@ data class AnalyzedOfferState(
 
 @Singleton
 class DriverAssistController @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val captureManager: CaptureManager,
     private val parser: RideParser,
     private val profitCalculator: ProfitCalculator,
@@ -73,7 +79,7 @@ class DriverAssistController @Inject constructor(
         }
     }
 
-    private fun processCapturedOffer(event: CaptureEvent.OfferTextCaptured) {
+    private suspend fun processCapturedOffer(event: CaptureEvent.OfferTextCaptured) {
         val startNs = System.nanoTime()
         val parseResult = parser.parse(event.offerText)
         if (parseResult !is ParseResult.Success) return
@@ -81,10 +87,30 @@ class DriverAssistController @Inject constructor(
         val offer = parseResult.offer
         val profile = ExpenseProfile(fuelCostPerKm = cachedSettings.fuelCostPerKm)
         val profit = profitCalculator.calculate(offer, profile)
-        val homeDist = HomeDistanceResult(
-            distanceKm = null,
-            displayLabel = if (cachedHomeZone == null) "HOME not set" else "UNKNOWN (No dest coords)"
-        )
+
+        val fallbackRules = RulesEngine.rules.value
+        val activeHome = cachedHomeZone ?: run {
+            val lat = fallbackRules.homeLat.toDoubleOrNull()
+            val lon = fallbackRules.homeLon.toDoubleOrNull()
+            if (lat != null && lon != null) HomeZone(fallbackRules.homeName, lat, lon, fallbackRules.homeRadiusKm) else null
+        }
+
+        val homeDist = if (activeHome == null) {
+            HomeDistanceResult(distanceKm = null, displayLabel = "HOME not set")
+        } else {
+            val destCoords = DestinationGeocoder.resolveCoordinates(context, offer.destinationText)
+            if (destCoords == null) {
+                HomeDistanceResult(distanceKm = null, displayLabel = "UNKNOWN (Offline/No match)")
+            } else {
+                val km = HomeDistanceCalculator.calculateHaversineKm(
+                    activeHome.latitude,
+                    activeHome.longitude,
+                    destCoords.first,
+                    destCoords.second
+                )
+                HomeDistanceCalculator.formatDistance(km)
+            }
+        }
         val score = scoringEngine.score(offer, profit, homeDist.distanceKm)
         val totalMs = (System.nanoTime() - startNs) / 1_000_000L + event.captureDurationMs
 
